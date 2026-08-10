@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Topo-Sweep — Итоговые результаты</title>
+<style>
+  :root { color-scheme: light; }
+  html { background: #ffffff; }
+  body {
+    background: #ffffff; color: #1a1a1a;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55; max-width: 980px; margin: 0 auto; padding: 40px 28px 96px; font-size: 15.5px;
+  }
+  h1, h2, h3 { line-height: 1.25; margin-top: 1.9em; margin-bottom: .5em; font-weight: 650; }
+  h1 { font-size: 1.85em; border-bottom: 2px solid #e5e7eb; padding-bottom: .3em; margin-top: .2em; }
+  h2 { font-size: 1.4em; border-bottom: 1px solid #eceef1; padding-bottom: .25em; }
+  h3 { font-size: 1.13em; }
+  a { color: #1a56db; }
+  hr { border: 0; border-top: 1px solid #e5e7eb; margin: 2em 0; }
+  code { background: #f3f4f6; border-radius: 4px; padding: .12em .38em;
+    font-family: "SF Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; font-size: .89em; }
+  pre { background: #f6f8fa; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 14px; }
+  th, td { border: 1px solid #dfe3e8; padding: 7px 11px; text-align: left; }
+  th { background: #f5f7fa; font-weight: 640; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  details { margin: 1em 0; padding: .4em .9em; border: 1px solid #e5e7eb; border-radius: 8px; background: #fbfcfd; }
+  summary { cursor: pointer; font-weight: 600; padding: .3em 0; }
+  details[open] summary { border-bottom: 1px solid #eceef1; margin-bottom: .6em; }
+  strong { font-weight: 660; }
+</style>
+</head>
+<body>
+<h1>Topo-Sweep — Итоговые результаты</h1>
+<p><strong>Модель:</strong> Qwen3.6-35B-A3B-FP8 · <strong>Железо:</strong> 8×H100, GPU 3,5,6,7 (фиксированный бюджет <strong>4 GPU</strong> во всех прогонах) · <strong>Точка входа:</strong> удалённый LiteLLM proxy во всех прогонах, кроме помеченных <strong>direct</strong>. Маршрутизация proxy — <strong><code>simple-shuffle</code></strong> (случайная реплика, без session affinity).</p>
+<p><strong>Главный вопрос:</strong> могут ли несколько небольших реплик vLLM за LiteLLM proxy сравняться по скорости со встроенным <strong>DP4</strong>, избегая при этом порчи вывода <code>!!!!</code> (баг DP4 с prefix caching)?</p>
+<hr>
+<h2>0. Обозначения</h2>
+<ul>
+<li><strong>Каждый запрос: prefill → decode.</strong> <em>Prefill</em> обрабатывает весь промпт разом; <em>decode</em> генерирует токены по одному. <code>out_tok/s</code> считает decode-токены; TTFT определяется prefill.</li>
+<li><strong>Prefix caching (APC)</strong> позволяет пропустить повторный prefill уже виденных токенов промпта (общий system/tool-промпт между ходами). <code>apc</code> = кэш включён, <code>noapc</code> = выключен.</li>
+</ul>
+<p><strong>Метрики:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Метрика</th>
+<th>Что измеряет</th>
+<th>Лучше =</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>out_tok/s</strong></td>
+<td>суммарно decode-токенов в секунду</td>
+<td>выше</td>
+</tr>
+<tr>
+<td><strong>total wall (BFCL)</strong></td>
+<td>сумма времени по всем 6 ступеням concurrency</td>
+<td>ниже</td>
+</tr>
+<tr>
+<td><strong>TTFT p50 / p90 / p99</strong></td>
+<td>время до первого токена (медиана / хвосты), мс</td>
+<td>ниже</td>
+</tr>
+<tr>
+<td><strong>TPOT</strong></td>
+<td>среднее время на один decode-токен (мс) — «скорость печати» после первого токена</td>
+<td>ниже</td>
+</tr>
+<tr>
+<td><strong>prefix_hit_rate</strong></td>
+<td>доля токенов промпта из кэша</td>
+<td>выше</td>
+</tr>
+<tr>
+<td><strong>kv_peak</strong></td>
+<td>пиковая занятость KV-пула (0–1); ~1.0 = насыщение, риск вытеснения</td>
+<td>диагностика</td>
+</tr>
+</tbody>
+</table>
+<p>Хранятся перцентили p50 / p90 / p99; p95 нет.</p>
+<p><strong>Бенчмарки</strong> (лестница concurrency <strong>1 → 4 → 16 → 64 → 128 → 256</strong>, <code>num_prompts = 8 × concurrency</code>):</p>
+<ul>
+<li><strong>envelope</strong> — синтетика, лёгкая: ~1024 in / 512 out токенов. Голая пропускная способность decode.</li>
+<li><strong>medium</strong> — синтетика, тяжёлая: ~12000 in / 2048 out. Давление prefill, большой KV.</li>
+<li><strong>BFCL</strong> — реальный агентный workload (multi-turn tool-calling). Ходы делят большой system/tool-промпт → единственный, где prefix caching реально помогает. Метрика: total wall.</li>
+</ul>
+<p><strong>Топологии</strong> (бюджет 4 GPU):</p>
+<table>
+<thead>
+<tr>
+<th>Топология</th>
+<th>Реплик</th>
+<th>KV-пул на реплику</th>
+<th>Характер</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TP4×1</strong></td>
+<td>1 «толстая»</td>
+<td>наибольший</td>
+<td>один большой кэш</td>
+</tr>
+<tr>
+<td><strong>TP2×2</strong></td>
+<td>2 средних</td>
+<td>средний</td>
+<td>баланс</td>
+</tr>
+<tr>
+<td><strong>TP1×4</strong></td>
+<td>4 «тонких»</td>
+<td>наименьший</td>
+<td>больше compute, меньше кэша</td>
+</tr>
+<tr>
+<td><em>DP4</em></td>
+<td>4-в-1-процессе</td>
+<td>общий</td>
+<td>встроенный incumbent (только direct)</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2>(1) Смена версии/стека — лестница из трёх ступеней (BFCL)</h2>
+<p><strong>Изолируем:</strong> серверный стек. Топология, GPU, workload фиксированы.</p>
+<ol>
+<li><strong>0.20 baseline</strong> — vLLM 0.20.0, TRITON_ATTN, без кэша.</li>
+<li><strong>0.26 +stack (noapc)</strong> — vLLM 0.26.0, FLASH_ATTN + chunked-prefill, кэш ВЫКЛ.</li>
+<li><strong>0.26 +caching (apc)</strong> — то же + prefix caching.</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Топология</th>
+<th style="text-align: right;">0.20 wall</th>
+<th style="text-align: right;">0.26 noapc wall</th>
+<th style="text-align: right;">0.26 apc wall</th>
+<th style="text-align: right;">Δ stack (1→2)</th>
+<th style="text-align: right;">Δ caching (2→3)</th>
+<th style="text-align: right;">Итого 0.20→apc</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TP4×1</strong></td>
+<td style="text-align: right;">128.2 m</td>
+<td style="text-align: right;">145.4 m</td>
+<td style="text-align: right;"><strong>45.1 m</strong></td>
+<td style="text-align: right;">0.88×</td>
+<td style="text-align: right;"><strong>3.22×</strong></td>
+<td style="text-align: right;"><strong>2.84×</strong></td>
+</tr>
+<tr>
+<td><strong>TP2×2</strong></td>
+<td style="text-align: right;">99.9 m</td>
+<td style="text-align: right;">83.1 m</td>
+<td style="text-align: right;"><strong>38.1 m</strong></td>
+<td style="text-align: right;">1.20×</td>
+<td style="text-align: right;"><strong>2.18×</strong></td>
+<td style="text-align: right;"><strong>2.62×</strong></td>
+</tr>
+<tr>
+<td><strong>TP1×4</strong></td>
+<td style="text-align: right;">99.1 m</td>
+<td style="text-align: right;">58.5 m</td>
+<td style="text-align: right;"><strong>42.3 m</strong></td>
+<td style="text-align: right;"><strong>1.69×</strong></td>
+<td style="text-align: right;">1.38×</td>
+<td style="text-align: right;"><strong>2.34×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Результат.</strong> Стек 0.26 apc даёт <strong>2.3–2.8× выигрыша</strong> по wall везде. Источник выигрыша меняется с топологией: у «толстой» TP4×1 почти весь выигрыш — это caching; у «тонкой» TP1×4 — сам апгрейд бэкенда. <strong>Победитель: vLLM 0.26</strong> (FLASH_ATTN + chunked-prefill). Ступень caching (2→3) показана для полноты, но §4 покажет, что её выигрыш <em>условен</em> (нужен session-affinity routing) — поэтому §2/§3 берут за продовую базу стек 0.26 с кэшем <strong>off</strong>, а кэш on считают upside.</p>
+<details>
+<summary><b>Та же лестница на синтетике (envelope + medium) — раскрыть</b></summary>
+<p>Промпты почти не повторяются → caching (2→3) — no-op. Значения @c256: out_tok/s · TTFT p50 ms · TPOT mean ms.</p>
+<p><strong>envelope @c256</strong></p>
+<table>
+<thead>
+<tr>
+<th>Topology</th>
+<th>0.20</th>
+<th>0.26 noapc</th>
+<th>0.26 apc</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td>9 498 · 721 · 25.2</td>
+<td>9 755 · 2 104 · 21.9</td>
+<td>9 436 · 1 222 · 24.3</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td>10 813 · 746 · 20.7</td>
+<td>10 642 · 1 140 · 22.7</td>
+<td>10 690 · 610 · 21.6</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td>10 703 · 769 · 20.4</td>
+<td><strong>12 082</strong> · 802 · 17.8</td>
+<td>11 108 · 581 · 19.7</td>
+</tr>
+</tbody>
+</table>
+<p><strong>medium @c256</strong></p>
+<table>
+<thead>
+<tr>
+<th>Topology</th>
+<th>0.20</th>
+<th>0.26 noapc</th>
+<th>0.26 apc</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td>4 542 · 1 662 · 52.8</td>
+<td>4 641 · 5 178 · 50.7</td>
+<td>4 721 · 1 968 · 50.5</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td>6 449 · 3 937 · 34.5</td>
+<td>6 739 · 4 503 · 33.1</td>
+<td>6 708 · 3 543 · 34.0</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td>7 239 · 3 634 · 30.8</td>
+<td><strong>8 131</strong> · 3 564 · 26.2</td>
+<td>7 994 · 2 762 · 27.4</td>
+</tr>
+</tbody>
+</table>
+<p>На синтетике apc ≈ noapc (±1–2 %) — caching платит только на BFCL.</p>
+</details>
+<hr>
+<h2>(2) Число реплик при фиксированных 4 GPU — как в проде (кэш OFF, BFCL)</h2>
+<p><strong>Изолируем:</strong> раскладку реплик. Стек (0.26, MNBT по умолчанию <strong>8k</strong>), GPU, workload фиксированы. <strong>Prefix caching OFF</strong> — реалистичный продовый режим: без session-affinity routing <code>simple-shuffle</code> разбрасывает ходы сессии по репликам, и выигрыш по-сессионного кэша схлопывается на масштабе флота (см. §4). Кэш ON показан отдельно как <em>условный</em> upside.</p>
+<table>
+<thead>
+<tr>
+<th>Layout (reps)</th>
+<th style="text-align: right;">total wall</th>
+<th style="text-align: right;">out_tok/s @c256</th>
+<th style="text-align: right;">TTFT p50 @c256</th>
+<th style="text-align: right;">TTFT p99 @c256</th>
+<th style="text-align: right;">TPOT mean @c256</th>
+<th style="text-align: right;">kv_peak @c256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1 (1)</td>
+<td style="text-align: right;">145.4 m</td>
+<td style="text-align: right;">237</td>
+<td style="text-align: right;">43 497 ms</td>
+<td style="text-align: right;">79 270 ms</td>
+<td style="text-align: right;">169 ms</td>
+<td style="text-align: right;">0.20</td>
+</tr>
+<tr>
+<td>TP2×2 (2)</td>
+<td style="text-align: right;">83.1 m</td>
+<td style="text-align: right;">475</td>
+<td style="text-align: right;">10 776 ms</td>
+<td style="text-align: right;">69 127 ms</td>
+<td style="text-align: right;">151 ms</td>
+<td style="text-align: right;">0.21</td>
+</tr>
+<tr>
+<td><strong>TP1×4 (4)</strong></td>
+<td style="text-align: right;"><strong>58.5 m</strong></td>
+<td style="text-align: right;"><strong>895</strong></td>
+<td style="text-align: right;"><strong>2 646 ms</strong></td>
+<td style="text-align: right;"><strong>18 432 ms</strong></td>
+<td style="text-align: right;"><strong>117 ms</strong></td>
+<td style="text-align: right;">0.63</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Без кэша ранжирование инвертируется — TP1×4 выигрывает по всем осям:</strong> лучший wall (58.5 m), пропускная способность (895), хвосты (p99 18.4 s против 69–79 s). «Толстые» раскладки голодают по prefill: kv_peak = <strong>0.20–0.21</strong> (80 % KV простаивает) при TTFT p99 = 69–79 s — один/два планировщика не проталкивают достаточно prefill-токенов за шаг (это сюжет §5 про MNBT — исправимо, но при 8k они сильно голодают). 4 движка TP1×4 бросают 4× compute на неизбежный reprefill.</p>
+<p><strong>out_tok/s по ступеням (кэш off)</strong> — TP1×4 доминирует монотонно, без кроссовера:</p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th style="text-align: right;">c16</th>
+<th style="text-align: right;">c64</th>
+<th style="text-align: right;">c128</th>
+<th style="text-align: right;">c256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td style="text-align: right;">201</td>
+<td style="text-align: right;">235</td>
+<td style="text-align: right;">252</td>
+<td style="text-align: right;">237</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td style="text-align: right;">257</td>
+<td style="text-align: right;">421</td>
+<td style="text-align: right;">477</td>
+<td style="text-align: right;">475</td>
+</tr>
+<tr>
+<td><strong>TP1×4</strong></td>
+<td style="text-align: right;"><strong>411</strong></td>
+<td style="text-align: right;"><strong>671</strong></td>
+<td style="text-align: right;"><strong>858</strong></td>
+<td style="text-align: right;"><strong>895</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>TTFT p99 по ступеням (кэш off, мс):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th style="text-align: right;">c128 p99</th>
+<th style="text-align: right;">c256 p99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td style="text-align: right;">39 573</td>
+<td style="text-align: right;">79 270</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td style="text-align: right;">19 264</td>
+<td style="text-align: right;">69 127</td>
+</tr>
+<tr>
+<td><strong>TP1×4</strong></td>
+<td style="text-align: right;"><strong>6 610</strong></td>
+<td style="text-align: right;"><strong>18 432</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Условный upside — кэш ON (нужен session-affinity routing, которого у нас нет).</strong> Если флот мал <em>и</em> ходы сессии остаются на одной реплике, кэш возвращает преимущество «толстым» раскладкам:</p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th style="text-align: right;">wall OFF (в проде)</th>
+<th style="text-align: right;">wall ON</th>
+<th style="text-align: right;">hit @c256</th>
+<th style="text-align: right;">TTFT p99 ON</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td style="text-align: right;">145.4 m</td>
+<td style="text-align: right;"><strong>45.1 m</strong></td>
+<td style="text-align: right;">0.95</td>
+<td style="text-align: right;">2.4 s</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td style="text-align: right;">83.1 m</td>
+<td style="text-align: right;"><strong>38.1 m</strong></td>
+<td style="text-align: right;">0.83</td>
+<td style="text-align: right;">4.2 s</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td style="text-align: right;">58.5 m</td>
+<td style="text-align: right;">42.3 m</td>
+<td style="text-align: right;">0.29</td>
+<td style="text-align: right;">74.3 s ❌</td>
+</tr>
+</tbody>
+</table>
+<p>Но этот upside <strong>тает с размером флота</strong> (§4): hit-rate уже падает 0.95 → 0.83 → 0.29 при 1 → 2 → 4 репликах. На ~8–10 инстансах без session affinity по-сессионная часть исчезает; остаётся только общий system/tool-префикс (<em>пол</em>, а не 0.83). А при TP1×4 кэш уже вредит (p99 74 s). <strong>Колонку ON читать как потолок при условии session-affinity routing — не как продовое число.</strong></p>
+<details>
+<summary><b>Число реплик на синтетике (envelope + medium) — раскрыть</b></summary>
+<p>out_tok/s по concurrency; справа TTFT p50 / TPOT mean @c256.</p>
+<p><strong>envelope</strong></p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th style="text-align: right;">c16</th>
+<th style="text-align: right;">c64</th>
+<th style="text-align: right;">c128</th>
+<th style="text-align: right;">c256</th>
+<th>ttft_p50 / tpot @c256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td style="text-align: right;">2 096</td>
+<td style="text-align: right;">4 829</td>
+<td style="text-align: right;">6 788</td>
+<td style="text-align: right;">9 436</td>
+<td>1 222 / 24.3</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td style="text-align: right;">1 570</td>
+<td style="text-align: right;">4 614</td>
+<td style="text-align: right;">6 389</td>
+<td style="text-align: right;">10 690</td>
+<td>610 / 21.6</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td style="text-align: right;">1 818</td>
+<td style="text-align: right;">4 567</td>
+<td style="text-align: right;">6 919</td>
+<td style="text-align: right;"><strong>11 108</strong></td>
+<td>581 / 19.7</td>
+</tr>
+</tbody>
+</table>
+<p><strong>medium</strong></p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th style="text-align: right;">c16</th>
+<th style="text-align: right;">c64</th>
+<th style="text-align: right;">c128</th>
+<th style="text-align: right;">c256</th>
+<th>ttft_p50 / tpot @c256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP4×1</td>
+<td style="text-align: right;">1 841</td>
+<td style="text-align: right;">3 341</td>
+<td style="text-align: right;">4 280</td>
+<td style="text-align: right;">4 721</td>
+<td>1 968 / 50.5</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td style="text-align: right;">1 915</td>
+<td style="text-align: right;">4 104</td>
+<td style="text-align: right;">5 381</td>
+<td style="text-align: right;">6 708</td>
+<td>3 543 / 34.0</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td style="text-align: right;">1 817</td>
+<td style="text-align: right;">4 514</td>
+<td style="text-align: right;">5 989</td>
+<td style="text-align: right;"><strong>7 994</strong></td>
+<td>2 762 / 27.4</td>
+</tr>
+</tbody>
+</table>
+<p>На синтетике выигрывает TP1×4 (больше compute, нет общего префикса для кэша) — то же ранжирование, что и в таблице BFCL с кэшем off выше: <strong>без повторного использования промптов лучшая раскладка — тонкая с максимумом compute.</strong></p>
+</details>
+<p><strong>Результат. Как в проде (кэш off), победитель: TP1×4</strong> — лучший wall (58.5 m), пропускная способность (895 tok/s), хвосты (p99 18.4 s), а малый KV на реплику не помеха, раз кэшировать нечего. «Толстые» раскладки голодают по prefill при 8k (§5: тюнинг MNBT почти закрывает разрыв для TP2×2). <strong>Если</strong> позже добавить session-affinity routing, кэш сделает оптимумом <strong>TP2×2</strong> (38.1 m, p99 4.2 s) — но это условно, не сейчас. <strong>Важно:</strong> TP1×4 запускать с кэшем <em>явно off</em> (vLLM включает его по умолчанию) — с кэшем хвост взлетает до 74 s.</p>
+<hr>
+<h2>(3) Накладные расходы proxy и DP4</h2>
+<h3>3a. Плата за proxy — TP4×1 direct vs proxy</h3>
+<p><strong>Изолируем:</strong> точку входа (direct <code>127.0.0.1</code> vs LiteLLM proxy).</p>
+<table>
+<thead>
+<tr>
+<th>Бенчмарк @ concurrency</th>
+<th style="text-align: right;">direct out_tok/s</th>
+<th style="text-align: right;">proxy out_tok/s</th>
+<th style="text-align: right;">Цена proxy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>envelope @c256</td>
+<td style="text-align: right;">9 988</td>
+<td style="text-align: right;">9 436</td>
+<td style="text-align: right;">−5.5 %</td>
+</tr>
+<tr>
+<td>medium @c64</td>
+<td style="text-align: right;">3 558</td>
+<td style="text-align: right;">3 341</td>
+<td style="text-align: right;">−6.1 %</td>
+</tr>
+<tr>
+<td>medium @c128</td>
+<td style="text-align: right;">4 457</td>
+<td style="text-align: right;">4 280</td>
+<td style="text-align: right;">−4.0 %</td>
+</tr>
+<tr>
+<td>medium @c256</td>
+<td style="text-align: right;">5 187</td>
+<td style="text-align: right;">4 721</td>
+<td style="text-align: right;">−9.0 %</td>
+</tr>
+</tbody>
+</table>
+<p>Плата за proxy ~4–9 % пропускной способности; не бутылочное горло.</p>
+<h3>3b. DP4 (direct) vs все раскладки — как в проде (кэш off)</h3>
+<p>DP4 корректен только с кэшем <strong>OFF</strong> (<code>dp4noapc</code>); с кэшем портит BFCL. Реплики в проде тоже без кэша (нет session affinity, §2), поэтому честное <strong>продовое</strong> сравнение — <strong>все с кэшем off при одинаковом MNBT 8k</strong> (чистый тест движков). Кэш ON — тот же <em>условный</em> upside, что и в §2. База DP4 = 73.7 m.</p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th style="text-align: right;">BFCL wall — кэш <strong>OFF</strong> (в проде)</th>
+<th>vs DP4</th>
+<th style="text-align: right;">BFCL wall — кэш <strong>ON</strong> (upside)</th>
+<th>vs DP4</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DP4 (direct)</strong></td>
+<td style="text-align: right;"><strong>73.7 m</strong></td>
+<td>base</td>
+<td style="text-align: right;">— (портит)</td>
+<td>—</td>
+</tr>
+<tr>
+<td>TP4×1</td>
+<td style="text-align: right;">145.4 m</td>
+<td>0.51× (медленнее)</td>
+<td style="text-align: right;">45.1 m</td>
+<td>1.63×</td>
+</tr>
+<tr>
+<td>TP2×2</td>
+<td style="text-align: right;">83.1 m</td>
+<td>0.89× (медленнее)</td>
+<td style="text-align: right;">38.1 m</td>
+<td>1.93×</td>
+</tr>
+<tr>
+<td><strong>TP1×4</strong></td>
+<td style="text-align: right;"><strong>58.5 m</strong></td>
+<td><strong>1.26× быстрее</strong></td>
+<td style="text-align: right;">42.3 m</td>
+<td>1.74×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Синтетика @c256</strong> (DP4 лидирует, caching неактивен):</p>
+<table>
+<thead>
+<tr>
+<th>Workload @c256</th>
+<th style="text-align: right;">DP4</th>
+<th style="text-align: right;">TP1×4</th>
+<th style="text-align: right;">TP2×2</th>
+<th style="text-align: right;">TP4×1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>envelope out_tok/s</td>
+<td style="text-align: right;"><strong>13 373</strong></td>
+<td style="text-align: right;">12 082</td>
+<td style="text-align: right;">10 642</td>
+<td style="text-align: right;">9 755</td>
+</tr>
+<tr>
+<td>medium out_tok/s</td>
+<td style="text-align: right;"><strong>8 778</strong></td>
+<td style="text-align: right;">8 131</td>
+<td style="text-align: right;">6 739</td>
+<td style="text-align: right;">4 641</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Результат.</strong> Как в проде (все без кэша, одинаковый 8k MNBT): <strong>DP4 обгоняет TP2×2 и TP4×1</strong> движок-к-движку и выигрывает всю синтетику; <strong>только TP1×4 (58.5 m) быстрее DP4</strong> (1.26×). Большое преимущество реплик 1.6–1.9× есть <strong>только в колонке с кэшем on</strong> — при условии session-affinity routing, которого нет. DP4-noapc сам по себе <em>безопасен</em> (кэш off = нет порчи) и годится как fallback; ценность TP1×4-noapc — это 1.26× скорости плюс горизонтальное масштабирование.</p>
+<hr>
+<h2>(4) Выигрыш prefix caching vs число реплик (BFCL, A/B по одной переменной)</h2>
+<p><strong>Изолируем:</strong> prefix caching on vs off.</p>
+<table>
+<thead>
+<tr>
+<th>Layout (reps)</th>
+<th style="text-align: right;">wall OFF</th>
+<th style="text-align: right;">wall ON</th>
+<th style="text-align: right;">Speedup</th>
+<th style="text-align: right;">hit @c256</th>
+<th style="text-align: right;">TTFT p99 @c256, off → on</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TP4×1 (1)</strong></td>
+<td style="text-align: right;">145.4 m</td>
+<td style="text-align: right;">45.1 m</td>
+<td style="text-align: right;"><strong>3.22×</strong></td>
+<td style="text-align: right;">0.95</td>
+<td style="text-align: right;">79.3 s → <strong>2.4 s</strong></td>
+</tr>
+<tr>
+<td><strong>TP2×2 (2)</strong></td>
+<td style="text-align: right;">83.1 m</td>
+<td style="text-align: right;">38.1 m</td>
+<td style="text-align: right;"><strong>2.18×</strong></td>
+<td style="text-align: right;">0.83</td>
+<td style="text-align: right;">69.1 s → <strong>4.2 s</strong></td>
+</tr>
+<tr>
+<td>TP1×4 (4)</td>
+<td style="text-align: right;">58.5 m</td>
+<td style="text-align: right;">42.3 m</td>
+<td style="text-align: right;">1.38×</td>
+<td style="text-align: right;">0.29</td>
+<td style="text-align: right;">18.4 s → <strong>74.3 s</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Результат.</strong> Выигрыш caching оправдан, только когда у реплики большой единый KV-пул <em>и</em> ходы сессии реально к ней возвращаются. С <code>simple-shuffle</code> второе не выполняется и ломается тем сильнее, чем больше флот: эрозия 0.95 → 0.83 → 0.29 при 1 → 2 → 4 репликах экстраполируется почти в ноль по-сессионного hit на ~8–10 инстансах. Выживает только общий system/tool-префикс (пол, не заголовочный выигрыш). <strong>Значит caching — это <em>условный upside</em>, а не базовая возможность:</strong> он оправдывает колонки «кэш ON» в §2/§3 лишь при добавлении session-affinity routing. До тех пор — деплой с кэшем <strong>off</strong>; при TP1×4 — off в любом случае (там кэш ухудшает хвост до 74 s).</p>
+<hr>
+<h2>(5) Аблация <code>max-num-batched-tokens</code> (BFCL, кэш off)</h2>
+<p><strong>Изолируем:</strong> <code>--max-num-batched-tokens</code> <strong>8192 → 16384</strong>. Всё остальное фиксировано.</p>
+<p>MNBT — бюджет токенов на шаг, делится между prefill и decode. При 8192 noapc-реплики голодают по prefill (очередь ограничена пропускной способностью prefill, не <code>max-num-seqs</code>). Признак голодания — простаивающий KV (низкий kv_peak при высоком TTFT).</p>
+<table>
+<thead>
+<tr>
+<th>Shape (noapc)</th>
+<th style="text-align: right;">MNBT</th>
+<th style="text-align: right;">total wall</th>
+<th style="text-align: right;">out_tok/s @c256</th>
+<th style="text-align: right;">TTFT p50 @c256</th>
+<th style="text-align: right;">TTFT p90 @c256</th>
+<th style="text-align: right;">TPOT p90 @c256</th>
+<th style="text-align: right;">kv_peak @c256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TP2×2</strong></td>
+<td style="text-align: right;">8 192</td>
+<td style="text-align: right;">83.1 m</td>
+<td style="text-align: right;">475</td>
+<td style="text-align: right;">10 776 ms</td>
+<td style="text-align: right;">35 623 ms</td>
+<td style="text-align: right;">194 ms</td>
+<td style="text-align: right;"><strong>0.21</strong></td>
+</tr>
+<tr>
+<td><strong>TP2×2</strong></td>
+<td style="text-align: right;">16 384</td>
+<td style="text-align: right;"><strong>58.5 m</strong></td>
+<td style="text-align: right;"><strong>747</strong></td>
+<td style="text-align: right;"><strong>2 078 ms</strong></td>
+<td style="text-align: right;"><strong>9 163 ms</strong></td>
+<td style="text-align: right;">196 ms</td>
+<td style="text-align: right;">0.43</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td style="text-align: right;">8 192</td>
+<td style="text-align: right;">58.5 m</td>
+<td style="text-align: right;">895</td>
+<td style="text-align: right;">2 646 ms</td>
+<td style="text-align: right;">8 700 ms</td>
+<td style="text-align: right;">190 ms</td>
+<td style="text-align: right;">0.63</td>
+</tr>
+<tr>
+<td>TP1×4</td>
+<td style="text-align: right;">16 384</td>
+<td style="text-align: right;">54.5 m</td>
+<td style="text-align: right;">915</td>
+<td style="text-align: right;">1 183 ms</td>
+<td style="text-align: right;">4 827 ms</td>
+<td style="text-align: right;"><strong>256 ms</strong></td>
+<td style="text-align: right;"><strong>0.98</strong></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>TP2×2 — большой чистый выигрыш:</strong> wall −30 %, out_tok/s +57 %, TTFT p90 −74 %, TPOT без изменений. Стартовала с простаивающим KV (0.21), запас есть даже при 16384 (0.43).</li>
+<li><strong>TP1×4 — малый выигрыш, с ценой:</strong> wall всего −7 %, но kv_peak упирается в 0.98 (потолок памяти), TPOT p90 растёт +35 % (крупный prefill крадёт слоты decode).</li>
+</ul>
+<p><strong>Результат.</strong> MNBT — реальный рычаг для noapc-раскладок с запасом KV: TP2×2-noapc при 16384 догоняет TP1×4 по wall (58.5 m). Правило: поднимать MNBT, пока kv_peak &lt; ~0.9. В apc-проде рычаг почти бесполезен (кэш уже убирает reprefill).</p>
+<hr>
+<h2>Итоговое решение</h2>
+<ol>
+<li><strong>Стек:</strong> vLLM 0.26.0 (FLASH_ATTN + chunked-prefill). На продовой тонкой раскладке уже это даёт <strong>1.69×</strong> над 0.20 на BFCL — <em>без</em> кэша. Кэш — upside, не база (§4).</li>
+<li><strong>Топология как в проде (нет session affinity): TP1×4 с кэшем явно OFF.</strong> Лучший wall (58.5 m), пропускная способность (895 tok/s), хвосты (p99 18.4 s), и она <strong>обгоняет DP4 в 1.26×</strong> — единственная раскладка, делающая это без опоры на кэш. vLLM по умолчанию включает кэш; здесь его <strong>надо выключить</strong>, иначе хвост взлетает до 74 s.</li>
+<li><strong>Кэш — <em>условный</em> upside, не база.</strong> С <code>simple-shuffle</code> по-сессионный hit-rate тает 0.95 → 0.83 → 0.29 при росте числа реплик (§4) и падает до пола (общий префикс) на ~8–10 инстансах. <strong>Если</strong> добавить session-affinity routing, кэш сделает оптимумом <strong>TP2×2</strong> (38.1 m, p99 4.2 s) и все реплики обгонят DP4 в 1.6–1.9× — но это условно.</li>
+<li><strong>DP4</strong> — сильный движок (без кэша обгоняет TP2×2/TP4×1, выигрывает синтетику). <strong>DP4 с кэшем непригоден</strong> (порча <code>!!!!</code>); <strong>DP4-noapc (73.7 m) — безопасный fallback</strong>, если не нужна сложность proxy/реплик, ценой 1.26× wall от TP1×4-noapc.</li>
+<li><strong>Proxy дёшев</strong> (~4–9 %) — механизм горизонтального масштаба и будущего рычага session-affinity, который разблокирует кэш.</li>
+<li><strong><code>max-num-batched-tokens</code> (§5):</strong> при 8k «толстые» раскладки без кэша голодают по prefill (KV простаивает 0.20–0.21, хвосты 69–79 s); удвоение до 16384 срезало wall TP2×2-noapc на −30 %, p90 на −74 %. Поднимать, пока kv_peak &lt; ~0.9 — у TP2×2 есть запас, TP1×4 уже у потолка.</li>
+</ol>
+</body>
+</html>
